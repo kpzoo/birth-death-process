@@ -1,0 +1,25 @@
+% Snyer ODE set for time varying birth-death process
+
+% Assumptions
+% - uses function as arguments
+% - assumes time varying birth-death from Nee 1994
+% - uses equivalent birth rate for rate matrix from Nee 1994
+% - y is a column vector, ts a vector just included for ode113
+
+function dy = odeSnyBD(ts, y, xsetMx, numRV, Tsp, nLinCurr, inttT, lamt)
+
+% Ensure input dimension correct
+sz = size(y);
+if sz(2) ~= 1
+    error('y is not a column vector');
+end
+
+% Diagonal of time dependent rate matrix for reconstructed birth (Nee 1994)
+rateDiag = getNeeRatesTrapz(ts, xsetMx, numRV, Tsp, nLinCurr, inttT, lamt);
+
+% Solve non-linear differential equation set - RV filtering
+nonLinDiag = rateDiag*y;
+dy = y'.*(-rateDiag + nonLinDiag);
+
+% Ensure output is column vector like the input
+dy = dy';

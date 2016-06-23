@@ -1,0 +1,642 @@
+% Script to simulate and estimate time varying birth-death models with
+% comparison to analytic results in the constant rate case
+
+% Assumptions and modifications
+% - included extra function for logistic birth and death rates (Paradis)
+% - removed bootstrapping in favour of independent runs
+% - removed data exists boolean and renamed variables
+% - does bootstrap version of simBD4 for both Snyder and Paradis
+% - includes fmincon version of Paradis estimate
+% - can specify the speciation times from a file or generate a new set
+% - fixes T to max(tspec) which makes more sense esp for Paradis
+% - includes comparison of Paradis cdf estimates for constant rate
+% - added again the const rate test of both filter and tree speciations
+% - condition on a fixed time, T and n (previously drawed n)
+% - uses algorithms from Hohna 2013
+% - sampling prob of 1
+% - discretised time and used T, mu, a, b (= k in paper) from Nee 1994
+
+clearvars
+clc
+close all
+
+tic;
+
+% Booleans of importance
+useParadis = 1; % to generate a Paradis estimate of parameters
+wantPlot = 0; % plot from Paradis
+
+%% Initial parameters and definitions
+
+% Define rate function type and no. runs and tree tips
+rateID = 3;
+nBatch = 100;
+n = 100;
+
+% Birth and death rate types
+rateSet = {'const-const', '2phase-const', 'Nee', 'logistic'};
+rateName = rateSet(rateID);
+
+% Set parameters based on function choices
+switch(rateID)
+    case 1
+        % Constant rate birth-death
+        
+        % Parameter names and true values
+        lam = 0.1;
+        mu = 0.5*lam;
+        x = [lam mu];
+        xdefs = {'lam', 'mu'};
+        
+        % Points for discretised inference space
+        numRV = length(x);
+        mi = 20*ones(size(x));
+        
+        % Space symmetrically centred on true values
+        xmin = 0.1*x;
+        
+        % Define rate functions and integrals
+        lamt = @(x, tx) x(1)*ones(size(tx));
+        mut = @(x, tx) x(2)*ones(size(tx));
+        
+        % Integral of netRate is rhotT
+        netRate = @(x, tx) mut(x, tx) - lamt(x, tx);
+        rhotT = @(x, t1, t2) -(x(1) - x(2))*(t2 - t1);
+        
+        % Time for which process will run
+        T = 80;
+        
+    case 2
+        % Two-phase births and constant death rate
+        
+        % Parameter names and true values
+        lam1 = 0.01;
+        lam2 = 5*lam1;
+        mu = 0.5*lam1;
+        tau = 70;
+        x = [lam1 lam2 tau mu];
+        xdefs = {'lam1', 'lam2', 'tau', 'mu'};
+        
+        % Points for discretised inference space
+        numRV = length(x);
+        mi = 10*ones(size(x));
+        
+        % Space symmetrically centred on true values
+        %xmax = 10*x;
+        xmin = 0.1*x;
+        xmin(3) = x(3)/2;
+        %xmax(3) = x(3)*2;
+        
+        % Define rate functions and integrals, lamt and mut return vectors
+        lamt = @(x, tx) x(1)*ones(size(tx)).*(tx < x(3)) + x(2)*ones(size(tx)).*(tx >= x(3));
+        mut = @(x, tx) x(4)*ones(size(tx));
+        
+        % Integral of netRate is rhotT
+        netRate = @(x, tx) mut(x, tx) - lamt(x, tx);
+        %rhotT = @(x, t1, t2) ((x(4) - x(1))*(x(3) - t1) + (x(4) - x(2))*(t2 - x(3)))*(x(3) > t1 && x(3) < t2) +...
+        %   (x(4) - x(1))*(t2 - t1)*(x(3) >= t2) + (x(4) - x(2))*(t2 - t1)*(x(3) <= t1);
+        rhotT = @(x, t1, t2) ((x(4) - x(1))*(x(3) - t1) + (x(4) - x(2))*(t2 - x(3)));
+        
+        % Time for which process will run
+        T = 2*tau;
+        
+        
+    case 3
+        % Nee 1994 example time varying example
+        
+        % Set true parameters from Nee 1994
+        mu = 0.075;
+        k = 4;
+        a = 0.2;
+        x = [a k mu];
+        xdefs = {'a', 'k', 'mu'};
+        
+        % Space symmetrically centred on true values
+        xmin = 0.1*x;
+        
+        % Points for discretised inference space
+        numRV = length(x);
+        mi = 20*ones(size(x));
+        
+        % Define rate functions and integrals, lamt and mut return vectors
+        lamt = @(x, tx) x(2)*x(3)./(1 + x(1)*tx);
+        mut = @(x, tx) x(3)*ones(size(tx));
+        
+        % Integral of netRate is rhotT
+        netRate = @(x, tx) mut(x, tx) - lamt(x, tx);
+        rhotT = @(x, t1, t2) x(3)*(t2 - t1) - (x(2)*x(3)/x(1))*(log(x(1)*t2 + 1) - log(x(1)*t1 + 1));
+        
+        % Time for which process will run
+        T = 100;
+        
+        
+    case 4
+        % Logistic birth and death functions from Paradis 2010
+        
+        % NOTE: used positive alam and blam and put negtive signs in equations 
+        % for x(4) and x(2) both in lamt, mut and  rhotT
+        
+        % Set true parameters from Paradis 2010
+        blam = 0.02;
+        alam = 2;
+        bmu = 0.02;  
+        amu = 2.5;
+        x = [blam alam bmu amu];
+        xdefs = {'\beta_\lambda', '\alpha_\lambda', '\beta_\mu', '\alpha_\mu'};
+        
+        % Space symmetrically centred on true values
+        xmin = 0.1*x;
+        
+        % Points for discretised inference space
+        numRV = length(x);
+        mi = 10*ones(size(x));
+        
+        % Define rate functions and integrals, lamt and mut return vectors
+        lamt = @(x, tx) 1./(1 + exp(-x(1)*tx + x(2)));
+        mut = @(x, tx) 1./(1 + exp(-x(3)*tx + x(4)));
+        
+        % Integral of netRate is rhotT
+        netRate = @(x, tx) mut(x, tx) - lamt(x, tx);
+        rhotT = @(x, t1, t2) (1/x(3))*log((1 + exp(x(3)*t2 - x(4)))/(1 + exp(x(3)*t1 - x(4)))) -...
+            (1/x(1))*log((1 + exp(x(1)*t2 - x(2)))/(1 + exp(x(1)*t1 - x(2))));
+        
+        % Time for which process will run
+        T = 100;
+        
+    otherwise
+        disp('The specified rate id is not supported');
+end
+
+% Symmetrically place the limits around x
+xmax = xmin + 2*x;
+
+% Calculate parameter space
+m = prod(mi);
+xset = cell(1, 1);
+for i = 1:numRV
+    xset{i} = linspace(xmin(i), xmax(i), mi(i));
+end
+
+% Rate function r(t, s) = e^(int mut-lamt) and integrand of PtT
+rst = @(x, t1, t2) exp(rhotT(x, t1, t2));
+inttT = @(x, t1, t2) mut(x, t2).*rst(x, t1, t2);
+
+
+%% Simulate a true birth-death reconstructed tree
+
+% Tree tips and coalescent stream length
+nLin = 1:n;
+nData = n-1;
+
+% Prob of survival and integral of exp of mut-lamt, conditioned on T
+P0T = (1 + integral(@(t2)inttT(x, 0, t2), 0, T))^(-1);
+r0T = rst(x, 0, T);
+
+% Discretise time points for numerical integration
+nVals = 20000;
+t = linspace(0, T, nVals);
+
+% Calculate PtT from Nee 1994 and the exp rate integral rtT
+PtT = zeros(size(t));
+rtT = zeros(size(t));
+for i = 1:nVals
+    PtT(i) = (1 + integral(@(t2)inttT(x, t(i), t2), t(i), T))^(-1);
+    rtT(i) = rst(x, t(i), T);
+end
+
+% Prob a lineage survives from t to T with exactly 1 descendant (no branch)
+p1tT = (PtT.^2).*rtT;
+
+% Generate true cdf of reconstructed tree (Hohna 2013)
+tden = trapz(t, lamt(x, t).*p1tT, 2);
+tnum = cumtrapz(t, lamt(x, t).*p1tT, 2);
+tcdf = tnum./tden;
+
+% Draw uniform random variables but use 2*n as want to ensure
+% unique times result when use with CDF
+u = rand(nBatch, 2*n);
+u = sort(u, 2);
+
+% Speciation times variable (this is the data, entry 1 always 0)
+tspecB = zeros(nBatch, n);
+
+% Use interpolation to find speciation times corresponding to rand values
+for i = 1:nBatch
+    % Find nearest speciation time for cdf values u
+    tcheck = unique(sort(interp1(tcdf, t, u(i, :))));
+    if length(tcheck) < n
+        error(['Not enough unique tspecB values for i = ' num2str(i)]);
+    else
+        tspecB(i, 2:n) = tcheck(1:n-1);
+        tspecB(i, :) = sort(tspecB(i, :));
+    end
+end
+% Max speciation times
+TB = max(tspecB, [], 2);
+
+
+%% Paradis estimation
+
+if useParadis
+    % Variables to store batch estimates
+    cdfB = cell(1, nBatch);
+    xhatB = zeros(nBatch, numRV);
+    percB = zeros(nBatch, numRV);
+    ssminB = zeros(1, nBatch);
+    
+    % Use Paradis method on these bootstrapped times (no distinction for const
+    % rate birth-death case)
+    for i = 1:nBatch
+        paradBoot = minParadisNoBoot(xmin, xmax, xset, numRV, n, tspecB(i, :), t, TB(i), lamt,...
+            rhotT, inttT, 0, x, xdefs, []);
+        cdfB{i} = paradBoot.cdf;
+        xhatB(i, 1:numRV) = paradBoot.xhat;
+        percB(i, 1:numRV) = paradBoot.perc;
+        ssminB(i) = paradBoot.ssmin;
+        disp('**********************************************************');
+        disp(['Finished Paradis run: ' num2str(i) ' of ' num2str(nBatch)]);
+        disp('**********************************************************');
+    end
+    % Simulation time
+    tsimPar = toc/60;
+    disp(['Simulation time = ' num2str(tsimPar) ' mins']);
+    save(['batch_' num2str(rateID) '_' num2str(nBatch)]);
+    
+    % Histogram of square percentage errrors on each parameter
+    mperc = mean(percB, 1);
+    figure;
+    for i = 1:numRV
+        subplot(ceil(numRV/2), 2, i);
+        histogram(percB(:, i));
+        ylabel('freq')
+        xlabel(['% (1 - x_' num2str(i) 'hat/x_' num2str(i) ')^2'])
+        title(['Paradis %MSE = ' num2str(mperc(i))]);
+        grid;
+    end
+    
+    % Regerate the time points for each cdf
+    nt = length(paradBoot.cdf);
+    tB = zeros(nBatch, nt);
+    for i = 1:nBatch
+        tB(i, :) = (0:nt-1).*TB(i)/nt;
+    end
+    
+    % Reduce t to nt values by interpolation
+    tred = (0:nt-1).*T/nt;
+    tcdfred = interp1(t, tcdf, tred);
+    
+    % CDF space of batch estimates
+    figure;
+    plot(tred, tcdfred, 'k', 'linewidth', 2);
+    hold on
+    for i = 1:nBatch
+        %h = stairs(tspecB(i, :), (1:n)/n, 'b:');
+        %set(h, 'linewidth', 2);
+        h = plot(tB(i, :), cdfB{i}, ':');
+        set(h, 'Color', [0.8 0.8 0.8]);
+    end
+    hold off
+    xlabel('time');
+    ylabel('cumulative density');
+    legend('true CDF', 'empirical CDF', 'Paradis CDF', 'location', 'best');
+    legend('true CDF', 'Paradis batch CDFs', 'location', 'best');
+    title('Paradis bootstrap for time varying birth-death model');
+    grid;
+end
+
+%% Snyder filtering of the reconstructed process
+
+% Create a matrix of identifiers to tell which xset{i} values are used for
+% each entry in N(t) and lam(t) calculations
+IDMx = zeros(numRV, m);
+% Initialise with first variable which has no element repetitions
+idxset = 1:mi(1);
+IDMx(1, :) = repmat(idxset, 1, m/mi(1));
+for i = 2:numRV
+    % For further variables numReps gives the number of set repetitions
+    % while kronVec gives the number of element repetitions
+    idxset = 1:mi(i);
+    numReps = m/prod(mi(1:i));
+    kronVec = ones(1, prod(mi(1:i-1)));
+    IDMx(i, :) = repmat(kron(idxset, kronVec), 1, numReps);
+end
+
+% Get the values corresponding to the matrix
+xsetMx = zeros(numRV, m);
+for i = 1:numRV
+    xsetMx(i, :) = xset{i}(IDMx(i, :));
+end
+
+% Variables for results
+qnBlast = cell(1, nBatch);
+qmargB = cell(1, nBatch);
+tnB = cell(1, nBatch);
+xhatBS = zeros(nBatch, numRV);
+percBS = zeros(nBatch, numRV);
+tnBmax = 0;
+
+% Snyder on each bootstrapped dataset
+for i = 1:nBatch
+    [qnB, tnB0] = snyderBootstrap(m, tspecB(i, :), nData, xsetMx, numRV, rhotT, lamt, mut, nLin);
+    % Last posterior and marginals and times
+    tnB{i} = tnB0;
+    tnBmax = max([max(tnB0), tnBmax]);
+    qnBlast{i} = qnB(end, :);
+    [qmargB{i}, ~] = marginalise(numRV, IDMx, qnBlast{i}, mi);
+    % Conditional estimates
+    xhatTemp = qnB*xsetMx';
+    xhatBS(i, 1:numRV) = xhatTemp(end, :);
+    percBS(i, 1:numRV) = 100*((1 - xhatBS(i, 1:numRV)./x).^2);
+    disp('**********************************************************');
+    disp(['Finished Snyder boot: ' num2str(i) ' of ' num2str(nBatch)]);
+    disp('**********************************************************');
+end
+
+% Simulation time and data store
+tsimSny = toc/60 - tsimPar;
+disp(['Simulation time = ' num2str(tsimSny) ' mins']);
+clear qn qnB
+save(['batch_' num2str(rateID) '_' num2str(nBatch)]);
+
+% Histogram of square percentage errrors on each parameter
+mpercS = mean(percBS, 1);
+figure;
+for i = 1:numRV
+    subplot(ceil(numRV/2), 2, i);
+    histogram(percBS(:, i));
+    ylabel('freq')
+    xlabel(['% (1 - x_' num2str(i) 'hat/x_' num2str(i) ')^2'])
+    title(['Snyder %MSE = ' num2str(mpercS(i))]);
+    grid;
+end
+
+
+%% Analyse and plot results
+
+% Estimated rates based on function type
+if nBatch == 1
+    % True birth and death rates
+    mu_tn = mut(x, tnB);
+    lam_tn = lamt(x, tnB);
+
+    switch(rateID)
+        case 1
+            % Constant rate birth-death (can directly subst cond means)
+            muhat = mut(xhatBS, tnB);
+            lamhat = lamt(xhatBS, tnB);
+            
+        case 2
+            % Two-phase births and constant death rate
+            muhat = mut(xhatBS, tnB);
+            lamhat = zeros(size(tnB));
+            for i = 1:length(tnB)
+                % Use parameter space and factor in posterior (take mean)
+                I1 = tnB(i) <= xsetMx(3, :);
+                lamhat(i) = qnBlast{1}*(xsetMx(1, :).*I1 + xsetMx(2, :).*(~I1))';
+            end
+            
+        case 3
+            % Nee 1994 rates
+            muhat = xhatBS(3)*ones(size(tnB));
+            lamhat = zeros(size(tnB));
+            for i = 1:length(tnB)
+                lamhat(i) = qnBlast{1}*(xsetMx(2, :).*xsetMx(3, :)./(1 + xsetMx(1, :)*tnB(i)))';
+            end
+            
+        case 4
+            % Paradis logistic rates
+            muhat = zeros(size(tnB));
+            lamhat = zeros(size(tnB));
+            for i = 1:length(tnB)
+                lamhat(i) = qnBlast{1}*(1./(1 + exp(-xsetMx(1, :)*tnB(i) + xsetMx(2, :))))';
+                muhat(i) = qnBlast{1}*(1./(1 + exp(-xsetMx(3, :)*tnB(i) + xsetMx(4, :))))';
+            end   
+    end
+    
+    % Plot birth and death rates
+    figure;
+    [hAx, hLine1, hLine2] = plotyy(tnB, [lam_tn lamhat], tnB, [mu_tn muhat]);
+    xlabel('time');
+    xlim([tnB(1) tnB(end)]);
+    ylabel(hAx(1),'birth rate') % left y-axis
+    ylabel(hAx(2),'death rate') % right y-axis
+    
+    % Birth rates
+    hLine1(1).LineStyle = '-';
+    hLine1(1).Color = 'b';
+    hLine1(2).LineStyle = '-';
+    hLine1(2).Color = 'r';
+    
+    % Death rates
+    hLine2(1).LineStyle = '-.';
+    hLine2(1).Color = 'b';
+    hLine2(2).LineStyle = '-.';
+    hLine2(2).Color = 'r';
+    
+    legend('\lambda', '\lambda est', '\mu', '\mu est', 'location', 'best');
+    title('Estimated rates');
+    grid;
+else
+    % True birth and death rates on redefined time scale
+    ntS = 2000;
+    tn0 = (0:ntS-1).*tnBmax/ntS;
+    mu_tn = mut(x, tn0);
+    lam_tn = lamt(x, tn0);
+    
+    % Plot multiple reconstructions from batch runs
+    figure;
+    [hAx, hLine1, hLine2] = plotyy(tn0, lam_tn, tn0, mu_tn);
+    xlabel('time');
+    xlim([tn0(1) tn0(end)]);
+    ylabel(hAx(1),'birth rate') % left y-axis
+    ylabel(hAx(2),'death rate') % right y-axis
+    % Birth rates
+    hLine1(1).LineStyle = '-';
+    hLine1(1).Color = 'r';
+    % Death rates
+    hLine2(1).LineStyle = '-.';
+    hLine2(1).Color = 'r';
+    
+    hold on
+    for j = 1:nBatch
+        % Variables for this run
+        xhat = xhatBS(j, :);
+        tn = tnB{j};
+        qnlast = qnBlast{j};
+        
+        % Obtain estimates for jth run
+        [lamhat, muhat] = plotLamMuhat(xsetMx, xhat, tn, qnlast, rateID, mut, lamt);
+        [hAx, hLine1, hLine2] = plotyy(tn, lamhat, tn, muhat);
+        % Birth rates
+        hLine1(1).LineStyle = ':';
+        hLine1(1).Color = [0.6 0.6 0.6];
+        % Death rates
+        hLine2(1).LineStyle = ':';
+        hLine2(1).Color = [0.6 0.6 0.6];
+    end
+    hold off
+    %legend('\lambda', '\mu', '\lambda est', '\mu est', 'location', 'best');
+    title('Estimated rates');
+    grid;
+    
+    % Plot multiple reconstructions of lam(t), mu(t) from batch runs
+    figure;
+    subplot(2, 1, 1);
+    plot(tn0, lam_tn, 'r', 'linewidth', 2);
+    xlabel('time');
+    xlim([tn0(1) tn0(end)]);
+    ylabel('birth rate');
+    hold on
+    for j = 1:nBatch
+        % Variables for this run
+        xhat = xhatBS(j, :);
+        tn = tnB{j};
+        qnlast = qnBlast{j};
+        
+        % Obtain estimates for jth run
+        [lamhat, muhat] = plotLamMuhat(xsetMx, xhat, tn, qnlast, rateID, mut, lamt);
+        ha = plot(tn, lamhat, 'g:');
+        set(ha, 'Color', [0.5 0.5 0.5]);
+    end
+    grid;
+    legend('true trajectory', 'batch estimates', 'location', 'best');
+    hold off
+    
+    subplot(2, 1, 2);
+    plot(tn0, mu_tn, 'r', 'linewidth', 2);
+    xlabel('time');
+    xlim([tn0(1) tn0(end)]);
+    ylabel('death rate');  
+    hold on
+    for j = 1:nBatch
+        % Variables for this run
+        xhat = xhatBS(j, :);
+        tn = tnB{j};
+        qnlast = qnBlast{j};
+        
+        % Obtain estimates for jth run
+        [lamhat, muhat] = plotLamMuhat(xsetMx, xhat, tn, qnlast, rateID, mut, lamt);
+        hb = plot(tn, muhat, 'g:');
+        set(hb, 'Color', [0.5 0.5 0.5]);
+    end
+    grid;
+    legend('true', 'estimated', 'location', 'best');
+    hold off
+    
+end
+
+% Snyder marginals across runs
+figure;
+for i = 1:numRV
+    subplot(ceil(numRV/2), 2, i);
+    maxq = 0;
+    for j = 1:nBatch
+        % Obtain maxima for each posterior
+        qval = qmargB{j}{i};
+        maxq = max([maxq, max(qval)]);
+    end
+    % True values
+    plot([x(i) x(i)], [0 maxq], 'r', 'linewidth', 2);
+    hold on
+    for j = 1:nBatch
+        % Plot all batched posteriors
+        qval = qmargB{j}{i};
+        plot(xset{i}, qval, 'b.');
+    end
+    hold off
+    xlabel(['x_' num2str(i)]);
+    ylabel(['P(x_' num2str(i) ')']);
+    legend('true', 'marginals', 'location', 'best');
+    grid;
+    title('Replicate posteriors');
+end
+
+% Compare boxplots of estimates for each parameter between methods
+if useParadis
+    % Boxplot comparison assuming there are enough points
+    if nBatch > 10
+        figure;
+        for i = 1:numRV
+            subplot(1, numRV, i);
+            boxplot([xhatBS(:, i) xhatB(:, i)], 'labels',{'snyder','paradis'});
+            %ylabel(xdefs(i));
+            ylabel(['x_' num2str(i)]);
+            title(['True value = ' num2str(x(i))]);
+        end
+    end
+    
+    % Basic comparison
+    figure;
+    for i = 1:numRV
+        subplot(1, numRV, i);
+        plot(1:nBatch, [xhatBS(:, i) xhatB(:, i)], 'o');
+        hold on
+        plot(1:nBatch, x(i)*ones(1, nBatch), 'k');
+        hold off(
+        ylabel(['xhat_' num2str(i)]);
+        xlabel('replicater no.');
+    end
+    
+    % Calculate percentiles (95%) and mean estimate
+    Ppar = prctile(xhatB, [2.5 97.5]);
+    Psny = prctile(xhatBS, [2.5 97.5]);
+    Mpar = mean(xhatB);
+    Msny = mean(xhatBS);
+    
+    % Create a table
+    Method = {'True'; 'Snyder';'Paradis'};
+    Mest = [x; Msny; Mpar];
+    LB = [x; Psny(1, :); Ppar(1, :)];
+    UB = [x; Psny(2, :); Ppar(2, :)];
+    
+    if rateID == 4
+        % Some paradis results for logistic
+        Mpar2 = [0.026 2.485 0.088 5.465];
+        Ppar2 = zeros(2, 4);
+        Ppar2(1, :) = [-0.014 1.842 0.020 5.528];
+        Ppar2(2, :) = [0.044 3.353 2.224 109.98];
+        
+        % Additional table entry
+        Method{4} = 'Journal';
+        Mest = [x; Msny; Mpar; Mpar2];
+        LB = [x; Psny(1, :); Ppar(1, :); Ppar2(1, :)];
+        UB = [x; Psny(2, :); Ppar(2, :); Ppar2(2, :)];
+    end
+    
+    % Table of estimates
+    Tab1 = array2table(round(Mest', 4), 'VariableNames', Method);
+    rowname = cell(1, 1);
+    for i = 1:numRV
+        rowname{i} = ['x_' num2str(i)];
+    end
+    Tab1.Properties.RowNames = rowname;
+    Tab1.Properties.Description = 'Point estimates';
+    % Table of 2.5%
+    Tab2 = array2table(round(LB', 4), 'VariableNames', Method);
+    Tab2.Properties.RowNames = rowname;
+    Tab2.Properties.Description = '2.5 percentile';
+    % Table of 97.5%
+    Tab3 = array2table(round(UB', 4), 'VariableNames', Method);
+    Tab3.Properties.RowNames = rowname;
+    Tab3.Properties.Description = '97.5 percentile';
+    
+    % Summary plot for logistic
+    if rateID == 4
+        figure;
+        for i = 1:numRV
+            subplot(2, 2, i);
+            h = errorbar(1:3, [Msny(i) Mpar(i) Mpar2(i)], [Psny(1, i) Ppar(1, i) ...
+                Ppar2(1, i)], [Psny(2, i) Ppar(2, i) Ppar2(2, i)], 'rx');
+            grid;
+            h.XTickLabel = {'Snyder', 'Paradis', 'Journal'};
+            ylabel(['estimates of x_' num2str(i)]);
+        end
+        
+    end
+end
+
+% Simulation time and data store
+tsim = toc/60;
+disp(['Simulation time = ' num2str(tsim) ' mins']);
+clear qn qnB
+save(['batchData_' num2str(rateID) '_' num2str(nBatch)]);

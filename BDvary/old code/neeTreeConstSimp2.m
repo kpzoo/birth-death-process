@@ -1,0 +1,361 @@
+% Script to draw some speciation times from using the time varying rate
+% algorithms from Hohna 2013 but simplified to a constant rate process
+
+% Assumptions and modifications
+% - uses Nee form
+% - has 2 versions of variables to store results
+% - simple PtT function used and lam is scalar, no use of getPtT
+% - modified to use cumtrapz
+% - sampling prob of 1 and constant death rate
+% - discretised time and used T, mu, a, b (= k in paper) from Nee 1994
+
+clearvars
+clc
+close all
+
+tic;
+
+%% Basic parameters
+
+% Boolean to control formulation between Nee and Iwasa
+isNee = 0;
+
+% Initialisation of sim parameters
+mi = [20 20];
+numRV = length(mi);
+m = prod(mi);
+
+% Parameter search space with lam > mu as both in median of range
+minSpace = 3*[0.1 0.21];
+maxSpace = 3*[1 0.5];
+
+xdefs = {'lam', 'mu'};
+x = zeros(1, numRV);
+xset = cell(1, 1);
+for i = 1:numRV
+    xset{i} = linspace(minSpace(i), maxSpace(i), mi(i));
+    x(i) = median(xset{i});
+end
+
+% Set true parameters from Nee 1994
+mu = x(2);
+lam = x(1);
+n1 = 100;
+
+% Constant rate function r(t, s) = e^(int mu-lam) and integrand of Pt
+rst = @(t1, t2) exp((mu-lam)*(t2-t1));
+intT = @(t1, t2) mu*rst(t1, t2);
+
+% Check on PtT -> inf
+PtTinf = (1 + integral(@(t2)intT(0, t2), 0, 10^6))^(-1);
+PtTinfComp = 1 - mu/lam;
+disp(['Check of PtTinf: ' [num2str(PtTinf) ' ' num2str(PtTinfComp)]]);
+
+%% Simulate a true birth-death tree
+
+% Generate a suitable T assuming uniform prior across Tset
+nT = 5000;
+Tset = linspace(0, 100, nT);
+PTn = zeros(size(Tset));
+
+for i = 1:nT
+    % For each possible T get the PTn entry
+    Ti = Tset(i);
+    P0Ts = (1 + integral(@(t2)intT(0, t2), 0, Ti))^(-1);
+    % Get the P(T|n1) entry for each T (unnormalised)
+    PTn(i) = ((1 - P0Ts*rst(0, Ti)).^(n1-1)).*(P0Ts^2)*rst(0, Ti);
+end
+
+% Take T as maximum value (don't need to normalise)
+T = Tset(PTn == max(PTn));
+
+% Discretise time points for numerical integration
+nVals = 20000;
+t = linspace(0, T, nVals);
+PtT = zeros(size(t));
+ertT = zeros(size(t));
+for i = 1:nVals
+    PtT(i) = (1 + integral(@(t2)intT(t(i), t2), t(i), T))^(-1);
+    ertT(i) = rst(t(i), T);
+end
+
+% Get Pr(N(T) = 1 | N(t) = 1) = p1tT
+p1tT = (PtT.^2).*ertT;
+
+% Probability of n lineages at T given 1 at t = 0
+nLinSet = 1:1000;
+pn0T = zeros(size(nLinSet));
+P0T = PtT(1);
+er0T = ertT(1);
+for i = nLinSet
+    pn0T(i) = ((1 - P0T*er0T).^(i-1))*(P0T.^2)*er0T;
+end
+
+%% Hohna 2013 method for drawing speciation times
+
+% Using discretised form of eq 9 from Hohna 2013 where t^* replaced by
+% nearest element of t that satisfies 9 - take n-1 draws
+r = rand(1, n1-1);
+tden = trapz(t, lam.*p1tT, 2);
+tnum = cumtrapz(t, lam.*p1tT, 2);
+tcdf = tnum./tden;
+
+% Use interpolation to find speciation times corresponding to rand values
+tspec = interp1(tcdf, t, r);
+tspec = sort([0 tspec]);
+
+% Remove duplicate times and set the data length
+tspec = unique(tspec);
+n = length(tspec);
+nLin = 1:n;
+%nLin = 2:n;
+nData = n-1;
+%nData = length(nLin) -1;
+
+
+%% Perform Snyder estimation for 3 parameters using Nee 1994 Poisson rate
+
+% Set uniform joint prior q0 and maximum speciation time
+q0 = ones(1, m)/m;
+Tsp = max(tspec);
+
+% Posterior vectors on events
+qev = zeros(nData+1, m);
+qev(1, :) = q0;
+tev = zeros(nData, 1);
+
+% Cell to save output of ODE solver and set options
+qset = cell(1, 1);
+tset = cell(1, 1);
+options = odeset('NonNegative', 1:m);
+elemLen = zeros(1, nData);
+
+% Create a matrix of identifiers to tell which xset{i} values are used for
+% each entry in N(t) and lam(t) calculations
+IDMx = zeros(numRV, m);
+% Initialise with first variable which has no element repetitions
+idxset = 1:mi(1);
+IDMx(1, :) = repmat(idxset, 1, m/mi(1));
+for i = 2:numRV
+    % For further variables numReps gives the number of set repetitions
+    % while kronVec gives the number of element repetitions
+    idxset = 1:mi(i);
+    numReps = m/prod(mi(1:i));
+    kronVec = ones(1, prod(mi(1:i-1)));
+    IDMx(i, :) = repmat(kron(idxset, kronVec), 1, numReps);
+end
+
+% Get the values corresponding to the matrix
+xsetMx = zeros(numRV, m);
+for i = 1:numRV
+    xsetMx(i, :) = xset{i}(IDMx(i, :));
+end
+
+% Loop across coalescent events and perform filtering 
+for i = 1:nData
+    % Current no. lineages
+    nLinCurr = nLin(i);
+    
+    % Solve linear ODEs continuously with setting of options, no Q
+    [tsol, qsol] = ode113(@(ts, y) odeSnyBDvarySimpleConstNee(ts, y, xsetMx, numRV, Tsp, nLinCurr),...
+        [tspec(i) tspec(i+1)], qev(i, :)', options);
+    
+    % Assign the output values of time and posteriors
+    qset{i} = qsol;
+    tset{i} = tsol;
+    elemLen(i) = length(tsol);
+    
+    % Perturb the q posterior for the new event
+    lampert = getNeeTimeVarySimpleNee(tsol(end), xsetMx, numRV, Tsp, nLinCurr);
+    qev(i+1, :) = qsol(end, :);
+    tev(i+1) = tsol(end);
+    qev(i+1, :) = qev(i+1, :).*lampert./(qev(i+1, :)*lampert');
+    
+    disp(['Finished: ' num2str(i) ' of ' num2str(nData)]);
+    
+end
+
+% Get full length of ODE solution data and assign appending vectors
+lenFull = sum(elemLen);
+stop = 0;
+qn = -ones(lenFull, m);
+tn = -ones(lenFull, 1);
+
+% Append the cell based posterior and time data into a single structure
+for i = 1:nData
+    % Loop calculates the start and end points along the array successively
+    % and then assigns the appropriate cell element
+    start = stop + 1;
+    stop = elemLen(i) + start - 1;
+    tn(start:stop) = tset{i};
+    qn(start:stop, :) = qset{i};
+end
+
+% Simulation time
+tsim = toc/60;
+disp(['Simulation time = ' num2str(tsim) ' mins']);
+
+%% Analyse and plot results
+
+% Conditional mean
+xhat = qn*xsetMx';
+xhatmean = xhat;
+% Conditional variance
+xhatvar = qn*(xsetMx'.^2) - xhat.^2;
+xhatstd = sqrt(xhatvar);
+
+% Display structure for parameters
+est.x = x;
+est.xhat = xhat(end, :);
+est.lab = xdefs;
+disp(est);
+
+% Final posterior and marginalisations
+qnlast = qn(end, :);
+[qmarg, ~] = marginalise(numRV, IDMx, qnlast, mi);
+
+% Estimated and true birth and death rates
+mut = mu*ones(size(tn));
+lamt = lam(1)*ones(size(tn));
+muhat = est.xhat(2)*ones(size(tn));
+lamhat = est.xhat(1)*ones(size(tn));
+rates = [lamt lamhat mut muhat];
+maxr = max(max(rates));
+minr = min(min(rates));
+
+% Plot the marginal posteriors
+figure;
+for i = 1:numRV
+    subplot(ceil(numRV/2), 2, i);
+    plot(xset{i}, qmarg{i}, 'b', [x(i) x(i)], [0 max(qmarg{i})], 'k',...
+        [xhat(end, i) xhat(end, i)], [0 max(qmarg{i})], 'r');
+    xlabel(['x_' num2str(i)]);
+    ylabel(['P(x_' num2str(i) ')']);
+    legend('marginal', 'true', 'cond mean', 'location', 'best');
+    grid;
+end
+
+
+% Plot the true and estimated rate differences
+figure;
+subplot(2, 1, 1);
+plot(tn, lamt - mut, tn, lamhat - muhat);
+ylabel('\lambda - \mu');
+legend('real', 'estimated', 'location', 'best');
+xlabel('time');
+title('Rate differences');
+grid;
+subplot(2, 1, 2);
+plot(tn, cumtrapz(tn, lamt - mut, 1), tn, cumtrapz(tn, lamhat - muhat, 1));
+ylabel('integra of \lambda - \mu');
+legend('real', 'estimated', 'location', 'best');
+xlabel('time');
+title('Rate integral differences');
+grid;
+
+% Plot characteristics of the no. lineages simulated at T
+figure;
+subplot(2, 1, 1);
+plot(nLinSet, pn0T);
+xlabel('no. lineages at T, n');
+ylabel('Pr(N(T) = n | N(0) = 1)');
+title(['Probability on no. lineages at T = ' num2str(T)]);
+grid;
+subplot(2, 1, 2);
+stairs(tspec, 1:n);
+xlabel('time');
+ylabel('no lineages');
+title('Lineages through time plot');
+grid;
+
+
+%% Test same data with known working method
+
+% Posterior vectors on events
+qev2 = zeros(nData+1, m);
+qev2(1, :) = q0;
+tev2 = zeros(nData, 1);
+
+% Cell to save output of ODE solver and set options
+qset2 = cell(1, 1);
+tset2 = cell(1, 1);
+options = odeset('NonNegative', 1:m);
+elemLen2 = zeros(1, nData);
+
+% Loop across coalescent events and perform filtering 
+for i = 1:nData
+    % Current no. lineages
+    nLinCurr = nLin(i);
+    
+    % Solve linear ODEs continuously with setting of options, no Q
+    [tsol2, qsol2] = ode113(@(ts, y) odeSnyBDconstLamMu(ts, y, xsetMx, numRV, Tsp, nLinCurr),...
+        [tspec(i) tspec(i+1)], qev2(i, :)', options);
+    
+    % Assign the output values of time and posteriors
+    qset2{i} = qsol2;
+    tset2{i} = tsol2;
+    elemLen2(i) = length(tsol2);
+    
+    % Perturb the q posterior for the new event
+    lampert2 = getNeeRateLamMu(tsol2(end), xsetMx, numRV, Tsp, nLinCurr);
+    qev2(i+1, :) = qsol2(end, :);
+    tev2(i+1) = tsol2(end);
+    qev2(i+1, :) = qev2(i+1, :).*lampert2./(qev2(i+1, :)*lampert2');
+    
+    disp(['Finished: ' num2str(i) ' of ' num2str(nData)]);
+    
+end
+
+% Get full length of ODE solution data and assign appending vectors
+lenFull2 = sum(elemLen2);
+stop = 0;
+qn2 = -ones(lenFull2, m);
+tn2 = -ones(lenFull2, 1);
+
+% Append the cell based posterior and time data into a single structure
+for i = 1:nData
+    % Loop calculates the start and end points along the array successively
+    % and then assigns the appropriate cell element
+    start = stop + 1;
+    stop = elemLen2(i) + start - 1;
+    tn2(start:stop) = tset2{i};
+    qn2(start:stop, :) = qset2{i};
+end
+
+% Time range
+tnmin = min(tn);
+tnmax = max(tn);
+tnlen = length(tn);
+    
+
+% Conditional mean
+xhat2 = qn2*xsetMx';
+xhatmean2 = xhat2;
+% Conditional variance
+xhatvar2 = qn2*(xsetMx'.^2) - xhat2.^2;
+xhatstd2 = sqrt(xhatvar2);
+xstdub2 = xhatmean2 + 2*xhatstd2;
+xstdlb2 = xhatmean2 - 2*xhatstd2;
+
+% Display structure for parameters
+est2.x = x;
+est2.xhat = xhat2(end, :);
+est2.lab = xdefs;
+disp(est2);
+
+% Final posterior and marginalisations
+qnlast2 = qn2(end, :);
+[qmarg2, probSums] = marginalise(numRV, IDMx, qnlast2, mi);
+
+% Plot marginals for each parameter and real value
+figure;
+for i = 1:numRV
+    subplot(ceil(numRV/2), 2, i);
+    plot(xset{i}, qmarg2{i}, 'b', [x(i) x(i)], [0 max(qmarg2{i})], 'k',...
+        [xhat2(end, i) xhat2(end, i)], [0 max(qmarg2{i})], 'r');
+    xlabel(['x_' num2str(i)]);
+    ylabel(['P(x_' num2str(i) ')']);
+    legend('marginal', 'true', 'cond mean', 'location', 'best');
+    grid;
+end
+
